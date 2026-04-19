@@ -40,17 +40,22 @@ from .proto import wave3_pb2
 
 _LOGGER = logging.getLogger(__name__)
 
-# Sniffer Log-Konfiguration
+# --- SNIFFER CONFIGURATION ---
+ENABLE_SNIFFER = False
 SNIFFER_LOG_FILE = os.path.join(os.path.dirname(__file__), "wave3_sniffer.log")
 
 
 def _write_sniffer_log(msg: str) -> None:
+    if not ENABLE_SNIFFER:
+        return
     try:
         with open(SNIFFER_LOG_FILE, "a") as f:
             f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')} - {msg}\n")
     except Exception as e:
         _LOGGER.error("Wave3 Sniffer File Write Error: %s", e)
 
+
+# -----------------------------
 
 _AIRFLOW_TO_FAN_MODE: dict[int, str] = {20: "1", 40: "2", 60: "3", 80: "4", 100: "5"}
 _FAN_MODE_TO_AIRFLOW: dict[str, int] = {"1": 20, "2": 40, "3": 60, "4": 80, "5": 100}
@@ -113,11 +118,6 @@ def _create_wave3_command(device_sn: str, **kwargs: Any) -> Wave3CommandMessage 
 class Wave3(BaseInternalDevice):
 
     def _prepare_data(self, raw_data: bytes) -> dict[str, Any]:
-        if not hasattr(self, "_cached_power_state"):
-            init_pause = self.data.params.get("cfg_sys_pause", False)
-            init_power = self.data.params.get("cfg_main_power", True)
-            self._cached_power_state = {"sys_pause": init_pause, "main_power": init_power}
-
         try:
             msg = wave3_pb2.setMessage()
             msg.ParseFromString(raw_data)
@@ -140,11 +140,9 @@ class Wave3(BaseInternalDevice):
             cmd_func = getattr(h, "cmd_func", 0)
             cmd_id = getattr(h, "cmd_id", 0)
 
-            # --- DEEP SNIFFER START ---
-            if cmd_func == 254 and cmd_id in (1, 18, 21, 22):
+            if ENABLE_SNIFFER and cmd_func == 254 and cmd_id in (1, 18, 21, 22):
                 log_msg = f">>> DECRYPTED PROTOBUF <<< cmd_id: {cmd_id} | length: {len(pdata_bytes)} | hex: {pdata_bytes.hex()}"
                 _write_sniffer_log(log_msg)
-            # --- DEEP SNIFFER END ---
 
             result: dict[str, Any] = {}
 
@@ -166,12 +164,6 @@ class Wave3(BaseInternalDevice):
                 msg_obj.ParseFromString(pdata_bytes)
                 for field, value in msg_obj.ListFields():
                     result[field.name] = value
-                    if field.name == "cfg_sys_pause":
-                        self._cached_power_state["sys_pause"] = bool(value)
-                        if value: self._cached_power_state["main_power"] = False
-                    elif field.name == "cfg_main_power":
-                        self._cached_power_state["main_power"] = bool(value)
-                        if value: self._cached_power_state["sys_pause"] = False
 
             else:
                 msg_obj = wave3_pb2.DisplayPropertyUpload()
@@ -183,10 +175,6 @@ class Wave3(BaseInternalDevice):
             if result:
                 if "en_beep" in result:
                     result["en_beep"] = 0 if result["en_beep"] else 1
-
-                result["cfg_sys_pause"] = self._cached_power_state["sys_pause"]
-                result["cfg_main_power"] = self._cached_power_state["main_power"]
-
                 return {"params": result}
 
         except Exception:
@@ -394,10 +382,8 @@ class Wave3ClimateEntity(ClimateEntity):
     def hvac_mode(self) -> HVACMode:
         params = self._params()
 
-        sys_pause = params.get("cfg_sys_pause", False)
-        main_power = params.get("cfg_main_power", True)
-
-        if sys_pause in (1, True) or main_power in (0, False):
+        sleep_state = params.get("dev_sleep_state", 0)
+        if sleep_state == 1:
             return HVACMode.OFF
 
         mode_val = params.get("wave_operating_mode", 0)
@@ -418,27 +404,18 @@ class Wave3ClimateEntity(ClimateEntity):
     def set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         sn = self._device.device_info.sn
 
-        if not hasattr(self._device, "_cached_power_state"):
-            self._device._cached_power_state = {"sys_pause": False, "main_power": True}
-
         if hvac_mode == HVACMode.OFF:
             opt_state = {
                 "wave_operating_mode": 0,
-                "cfg_sys_pause": True,
-                "cfg_main_power": False
+                "dev_sleep_state": 1
             }
-            self._device._cached_power_state["sys_pause"] = True
-            self._device._cached_power_state["main_power"] = False
             self._send(_create_wave3_command(sn, cfg_sys_pause=True), opt_state)
         else:
             mode_id = next((k for k, v in self._ECOFLOW_MODE_MAP.items() if v == hvac_mode), 1)
             opt_state = {
                 "wave_operating_mode": mode_id,
-                "cfg_sys_pause": False,
-                "cfg_main_power": True
+                "dev_sleep_state": 0
             }
-            self._device._cached_power_state["sys_pause"] = False
-            self._device._cached_power_state["main_power"] = True
             self._send(_create_wave3_command(sn, cfg_main_power=True, cfg_wave_operating_mode=mode_id), opt_state)
         self.schedule_update_ha_state()
 
@@ -478,10 +455,7 @@ class Wave3ClimateEntity(ClimateEntity):
         self.schedule_update_ha_state()
 
     def turn_on(self) -> None:
-        opt_state = {"cfg_sys_pause": False, "cfg_main_power": True}
-        if hasattr(self._device, "_cached_power_state"):
-            self._device._cached_power_state["sys_pause"] = False
-            self._device._cached_power_state["main_power"] = True
+        opt_state = {"dev_sleep_state": 0}
         self._send(_create_wave3_command(self._device.device_info.sn, cfg_main_power=True), opt_state)
         self.schedule_update_ha_state()
 
