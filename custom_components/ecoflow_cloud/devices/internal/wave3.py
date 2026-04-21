@@ -22,13 +22,12 @@ from homeassistant.components.button import ButtonEntity
 from homeassistant.const import UnitOfTemperature, ATTR_TEMPERATURE
 from typing import Any, Optional, override
 from google.protobuf.json_format import MessageToDict
-from google.protobuf.message import Message as ProtoMessageRaw
 
 from custom_components.ecoflow_cloud.api import EcoflowApiClient
 from custom_components.ecoflow_cloud.api.message import PrivateAPIMessageProtocol
 from custom_components.ecoflow_cloud.devices import BaseInternalDevice, const
 from custom_components.ecoflow_cloud.number import LevelEntity
-from custom_components.ecoflow_cloud.button import GetMessageButtonEntity
+from custom_components.ecoflow_cloud.button import EnabledButtonEntity
 from custom_components.ecoflow_cloud.select import DictSelectEntity
 from custom_components.ecoflow_cloud.sensor import (
     LevelSensorEntity,
@@ -71,7 +70,7 @@ _PRESET_TO_SUBMODE: dict[str, int] = {PRESET_NONE: 0, PRESET_BOOST: 2, PRESET_SL
 class Wave3CommandMessage(PrivateAPIMessageProtocol):
     def __init__(
         self,
-        payload: wave3_pb2.Wave3ConfigWrite,
+        payload: Optional[wave3_pb2.Wave3ConfigWrite],
         packet: wave3_pb2.Wave3SetMessage,
     ):
         self._payload = payload
@@ -83,15 +82,16 @@ class Wave3CommandMessage(PrivateAPIMessageProtocol):
 
     @override
     def to_dict(self) -> dict:
-        payload_dict = MessageToDict(self._payload, preserving_proto_field_name=True)
-
         result = MessageToDict(self._packet, preserving_proto_field_name=True)
-        if "header" in result:
-            result["header"]["pdata"] = {type(self._payload).__name__: payload_dict}
-            result["header"].pop("seq", None)
+        if self._payload is not None:
+            payload_dict = MessageToDict(self._payload, preserving_proto_field_name=True)
+            if "header" in result:
+                result["header"]["pdata"] = {type(self._payload).__name__: payload_dict}
+                result["header"].pop("seq", None)
         return {type(self._packet).__name__: result}
 
-def _create_wave3_command(device_sn: str, **kwargs: Any) -> Wave3CommandMessage | dict[str, Any]:
+
+def _create_wave3_command(device_sn: str, **kwargs: Any) -> Optional[Wave3CommandMessage]:
     try:
         cw = wave3_pb2.Wave3ConfigWrite()
         for key, value in kwargs.items():
@@ -123,29 +123,29 @@ def _create_wave3_command(device_sn: str, **kwargs: Any) -> Wave3CommandMessage 
             except AttributeError:
                 _LOGGER.debug("Wave3: Unknown header attribute '%s' ignored.", attr)
 
-            h.pdata = pdata_bytes
-            return Wave3CommandMessage(cw, msg)
+        h.pdata = pdata_bytes
+        return Wave3CommandMessage(cw, msg)
 
     except Exception as exc:
         _LOGGER.exception("Wave3 ConfigWrite error: %s", exc)
-        return {}
+        return None
+
 
 def _create_heartbeat_message(device_sn: str) -> Wave3CommandMessage:
-        msg = wave3_pb2.setMessage()
-        h = msg.header
+    msg = wave3_pb2.Wave3SetMessage()
+    h = msg.header
 
-        # Der Trick: Von der App (32) an die App (32). Die Cloud liest mit und wacht auf.
-        h.src = 32
-        h.dest = 32
-        h.device_sn = device_sn
-        h.seq = random.randint(10, 999)
+    h.src = 32
+    h.dest = 32
+    h.device_sn = device_sn
+    h.seq = random.randint(10, 999)
 
-        try:
-            setattr(h, "from", "Android")
-        except AttributeError:
-            pass
+    try:
+        setattr(h, "from", "Android")
+    except AttributeError:
+        pass
 
-        return Wave3CommandMessage(None, msg)
+    return Wave3CommandMessage(None, msg)
 
 
 class Wave3(BaseInternalDevice):
@@ -178,7 +178,6 @@ class Wave3(BaseInternalDevice):
                 _write_sniffer_log(log_msg)
 
             result: dict[str, Any] = {}
-            msg_obj: Any
 
             if cmd_func == 254 and cmd_id in (1, 21):
                 msg_obj = wave3_pb2.Wave3DisplayPropertyUpload()
@@ -319,6 +318,17 @@ class Wave3(BaseInternalDevice):
                              lambda v: _create_wave3_command(sn, cfg_power_off_delay_set=int(v))),
         ]
 
+    def buttons(self, client: EcoflowApiClient) -> list[ButtonEntity]:
+        return [
+            EnabledButtonEntity(
+                client,
+                self,
+                "fullsync",
+                const.TRIGGER_FULL_SYNC,
+                lambda _: _create_heartbeat_message(self.device_info.sn),
+            ),
+        ]
+
     def climates(self, client: EcoflowApiClient) -> list[ClimateEntity]:
         return [Wave3ClimateEntity(client, self)]
 
@@ -359,8 +369,8 @@ class Wave3ClimateEntity(ClimateEntity):
             return self._device.data.params
         return {}
 
-    def _send(self, msg: Wave3CommandMessage | dict[str, Any], opt_state: dict[str, Any] | None = None) -> None:
-        if not isinstance(msg, Wave3CommandMessage):
+    def _send(self, msg: Optional[Wave3CommandMessage], opt_state: Optional[dict[str, Any]] = None) -> None:
+        if not msg:
             return
         try:
             self._client.send_set_message(self._device.device_info.sn, opt_state or {}, msg)
