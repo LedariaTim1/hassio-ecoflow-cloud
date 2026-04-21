@@ -18,14 +18,17 @@ from homeassistant.components.number import NumberEntity
 from homeassistant.components.select import SelectEntity
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.components.switch import SwitchEntity
+from homeassistant.components.button import ButtonEntity
 from homeassistant.const import UnitOfTemperature, ATTR_TEMPERATURE
 from typing import Any, Optional, override
 from google.protobuf.json_format import MessageToDict
+from google.protobuf.message import Message as ProtoMessageRaw
 
 from custom_components.ecoflow_cloud.api import EcoflowApiClient
 from custom_components.ecoflow_cloud.api.message import PrivateAPIMessageProtocol
 from custom_components.ecoflow_cloud.devices import BaseInternalDevice, const
 from custom_components.ecoflow_cloud.number import LevelEntity
+from custom_components.ecoflow_cloud.button import GetMessageButtonEntity
 from custom_components.ecoflow_cloud.select import DictSelectEntity
 from custom_components.ecoflow_cloud.sensor import (
     LevelSensorEntity,
@@ -120,12 +123,29 @@ def _create_wave3_command(device_sn: str, **kwargs: Any) -> Wave3CommandMessage 
             except AttributeError:
                 _LOGGER.debug("Wave3: Unknown header attribute '%s' ignored.", attr)
 
-        h.pdata = pdata_bytes
-        return Wave3CommandMessage(cw, msg)
+            h.pdata = pdata_bytes
+            return Wave3CommandMessage(cw, msg)
 
     except Exception as exc:
         _LOGGER.exception("Wave3 ConfigWrite error: %s", exc)
         return {}
+
+def _create_heartbeat_message(device_sn: str) -> Wave3CommandMessage:
+        msg = wave3_pb2.setMessage()
+        h = msg.header
+
+        # Der Trick: Von der App (32) an die App (32). Die Cloud liest mit und wacht auf.
+        h.src = 32
+        h.dest = 32
+        h.device_sn = device_sn
+        h.seq = random.randint(10, 999)
+
+        try:
+            setattr(h, "from", "Android")
+        except AttributeError:
+            pass
+
+        return Wave3CommandMessage(None, msg)
 
 
 class Wave3(BaseInternalDevice):
