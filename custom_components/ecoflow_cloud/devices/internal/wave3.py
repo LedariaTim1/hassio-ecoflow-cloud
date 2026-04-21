@@ -324,7 +324,7 @@ class Wave3(BaseInternalDevice):
                 client,
                 self,
                 "fullsync",
-                const.TRIGGER_FULL_SYNC,
+                "Trigger Full Sync",
                 lambda _: _create_heartbeat_message(self.device_info.sn),
             ),
         ]
